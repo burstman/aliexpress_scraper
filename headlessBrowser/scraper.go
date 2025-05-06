@@ -3,11 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
-	"math/rand"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/chromedp/cdproto/cdp"
@@ -16,7 +15,7 @@ import (
 )
 
 // SearchAliExpress scrapes AliExpress for products matching the query.
-func SearchAliExpress(query string, attempt int) ([]Product, error) {
+func SearchAliExpress(query string, attempt int, logger *SafeLogger, fileMu *sync.Mutex) ([]Product, error) {
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.ExecPath("/usr/bin/google-chrome"),
 		chromedp.Flag("headless", false),
@@ -30,13 +29,13 @@ func SearchAliExpress(query string, attempt int) ([]Product, error) {
 	allocCtx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
 	defer cancel()
 
-	ctx, cancel := chromedp.NewContext(allocCtx, chromedp.WithLogf(log.Printf))
+	ctx, cancel := chromedp.NewContext(allocCtx, chromedp.WithLogf(logger.Printf))
 	defer cancel()
 
 	attemptCtx, attemptCancel := context.WithTimeout(ctx, 600*time.Second)
 	defer attemptCancel()
 
-	log.Printf("Attempt %d: Searching for '%s'", attempt, query)
+	logger.Printf("Attempt %d: Searching for '%s'", attempt, query)
 	var screenshot []byte
 	var products []Product
 	var networkLogs []string
@@ -46,7 +45,7 @@ func SearchAliExpress(query string, attempt int) ([]Product, error) {
 	cookieName := "base"
 	cookiesFile := fmt.Sprintf("cookies_%s.json", strings.ReplaceAll(cookieName, " ", "_"))
 	if cookies, err := LoadCookies(cookiesFile); err == nil {
-		log.Printf("Loading cookies from %s", cookiesFile)
+		logger.Printf("Loading cookies from %s", cookiesFile)
 		err = chromedp.Run(attemptCtx,
 			chromedp.ActionFunc(func(ctx context.Context) error {
 				for _, cookie := range cookies {
@@ -59,19 +58,19 @@ func SearchAliExpress(query string, attempt int) ([]Product, error) {
 						WithHTTPOnly(cookie.HTTPOnly).
 						Do(ctx)
 					if err != nil {
-						log.Printf("Failed to set cookie %s: %v", cookie.Name, err)
+						logger.Printf("Failed to set cookie %s: %v", cookie.Name, err)
 					}
 				}
 				return nil
 			}))
 		if err != nil {
-			log.Printf("Failed to load cookies: %v", err)
+			logger.Printf("Failed to load cookies: %v", err)
 		} else {
-			log.Println("Cookies loaded successfully")
+			logger.Println("Cookies loaded successfully")
 			cookiesLoaded = true
 		}
 	} else {
-		log.Printf("No cookies file found or error loading %s: %v", cookiesFile, err)
+		logger.Printf("No cookies file found or error loading %s: %v", cookiesFile, err)
 	}
 
 	err := chromedp.Run(attemptCtx,
@@ -93,7 +92,7 @@ func SearchAliExpress(query string, attempt int) ([]Product, error) {
 		}),
 		chromedp.Navigate(`https://www.aliexpress.com/?language=en-US®ion=US`),
 		chromedp.WaitVisible(`body`, chromedp.ByQuery),
-		chromedp.Sleep(time.Duration(3+rand.Float64()*3)*time.Second),
+		chromedp.Sleep(3*time.Second),
 
 		chromedp.ActionFunc(func(ctx context.Context) error {
 			var popupVisible bool
@@ -101,18 +100,18 @@ func SearchAliExpress(query string, attempt int) ([]Product, error) {
 				return fmt.Errorf("popup check failed: %v", err)
 			}
 			if popupVisible {
-				log.Println("Dismissing popup...")
+				logger.Println("Dismissing popup...")
 				if err := chromedp.Click(`div.Sk1_X._1-SOk`, chromedp.ByQuery).Do(ctx); err != nil {
 					return fmt.Errorf("failed to click popup: %v", err)
 				}
-				chromedp.Sleep(time.Duration(1+rand.Float64()*2) * time.Second).Do(ctx)
+				chromedp.Sleep(1 * time.Second).Do(ctx)
 			}
 			return nil
 		}),
 
 		chromedp.ActionFunc(func(ctx context.Context) error {
 			if cookiesLoaded {
-				log.Println("Cookies loaded, skipping language modification")
+				logger.Println("Cookies loaded, skipping language modification")
 				return nil
 			}
 			var flagVisible bool
@@ -120,7 +119,7 @@ func SearchAliExpress(query string, attempt int) ([]Product, error) {
 				return fmt.Errorf("flag check failed: %v", err)
 			}
 			if flagVisible {
-				log.Println("Switching to English...")
+				logger.Println("Switching to English...")
 				if err := chromedp.Click(`span.ship-to--cssFlag--3qFf5C9.country-flag-y2023.TN`, chromedp.ByQuery).Do(ctx); err != nil {
 					return fmt.Errorf("failed to click flag: %v", err)
 				}
@@ -130,7 +129,7 @@ func SearchAliExpress(query string, attempt int) ([]Product, error) {
 				if err := chromedp.Click(`div.select--text--1b85oDo`, chromedp.ByQuery).Do(ctx); err != nil {
 					return fmt.Errorf("failed to click language selector: %v", err)
 				}
-				chromedp.Sleep(time.Duration(2+rand.Float64()*3) * time.Second).Do(ctx)
+				chromedp.Sleep(2 * time.Second).Do(ctx)
 				var englishSelected bool
 				if err := chromedp.Evaluate(`
 					var options = Array.from(document.querySelectorAll('div.select--item--32FADYB'));
@@ -149,12 +148,12 @@ func SearchAliExpress(query string, attempt int) ([]Product, error) {
 				if err := chromedp.Click(`div.es--saveBtn--w8EuBuy`, chromedp.ByQuery).Do(ctx); err != nil {
 					return fmt.Errorf("failed to click validate button: %v", err)
 				}
-				chromedp.Sleep(time.Duration(10+rand.Float64()*5) * time.Second).Do(ctx)
+				chromedp.Sleep(10 * time.Second).Do(ctx)
 				var pageLang string
 				if err := chromedp.Evaluate(`document.documentElement.lang`, &pageLang).Do(ctx); err != nil {
 					return fmt.Errorf("failed to check page language: %v", err)
 				}
-				log.Printf("Page language: %s", pageLang)
+				logger.Printf("Page language: %s", pageLang)
 				if pageLang != "en" && pageLang != "en-US" {
 					return fmt.Errorf("page language is %s, expected en or en-US", pageLang)
 				}
@@ -172,15 +171,15 @@ func SearchAliExpress(query string, attempt int) ([]Product, error) {
 			if err := chromedp.Click(`input.search--submit--2VTbd-T`, chromedp.ByQuery).Do(ctx); err != nil {
 				return fmt.Errorf("failed to click search button: %v", err)
 			}
-			chromedp.Sleep(time.Duration(20+rand.Float64()*10) * time.Second).Do(ctx)
+			chromedp.Sleep(20 * time.Second).Do(ctx)
 			return nil
 		}),
 
 		chromedp.ActionFunc(func(ctx context.Context) error {
 			if err := chromedp.Screenshot(`body`, &screenshot, chromedp.ByQuery).Do(ctx); err != nil {
-				log.Printf("Failed to take pre-orders screenshot: %v", err)
-			} else if err := WriteFile(fmt.Sprintf("screenshot_before_orders_%d.png", attempt), screenshot, 0644); err != nil {
-				log.Printf("Failed to save pre-orders screenshot: %v", err)
+				logger.Printf("Failed to take pre-orders screenshot: %v", err)
+			} else if err := WriteFile(fmt.Sprintf("screenshot_before_orders_%s_%d.png", query, attempt), screenshot, 0644, fileMu); err != nil {
+				logger.Printf("Failed to save pre-orders screenshot: %v", err)
 			}
 			return nil
 		}),
@@ -207,64 +206,64 @@ func SearchAliExpress(query string, attempt int) ([]Product, error) {
 					return fmt.Errorf("failed to click Orders button: %v", err)
 				}
 			}
-			log.Println("Sorted by orders")
-			chromedp.Sleep(time.Duration(10+rand.Float64()*15) * time.Second).Do(ctx)
+			logger.Println("Sorted by orders")
+			chromedp.Sleep(10 * time.Second).Do(ctx)
 			return nil
 		}),
 
 		chromedp.ActionFunc(func(ctx context.Context) error {
-			log.Println("Scrolling to load products...")
+			logger.Println("Scrolling to load products...")
 			var prevCardCount, prevScrollHeight int
 			for i := 0; i < 25; i++ {
 				var scrollHeight int
 				if err := chromedp.Evaluate(`
-					window.scrollBy(0, window.innerHeight * (Math.random() * 0.5 + 0.5));
+					window.scrollBy(0, window.innerHeight * 0.5);
 					document.documentElement.scrollHeight;
 				`, &scrollHeight).Do(ctx); err != nil {
-					log.Printf("Scroll %d failed: %v", i+1, err)
+					logger.Printf("Scroll %d failed: %v", i+1, err)
 				}
 				var cardCount int
 				if err := chromedp.Evaluate(`document.querySelectorAll('[id="card-list"] a.search-card-item').length`, &cardCount).Do(ctx); err != nil {
-					log.Printf("Scroll %d card count check failed: %v", i+1, err)
+					logger.Printf("Scroll %d card count check failed: %v", i+1, err)
 				}
-				log.Printf("Scroll %d: height=%d, cards=%d", i+1, scrollHeight, cardCount)
+				logger.Printf("Scroll %d: height=%d, cards=%d", i+1, scrollHeight, cardCount)
 				if cardCount >= 48 {
-					log.Println("Target card count reached")
+					logger.Println("Target card count reached")
 					break
 				}
 				if cardCount <= prevCardCount && scrollHeight <= prevScrollHeight && i > 2 {
-					log.Println("No new cards, refreshing scroll...")
+					logger.Println("No new cards, refreshing scroll...")
 					if err := chromedp.Evaluate(`
 						window.scrollTo(0, 0);
 						window.scrollBy(0, document.body.scrollHeight);
 						document.documentElement.scrollHeight;
 					`, &scrollHeight).Do(ctx); err != nil {
-						log.Printf("Scroll refresh failed: %v", err)
+						logger.Printf("Scroll refresh failed: %v", err)
 					}
-					log.Printf("After refresh: height=%d", scrollHeight)
+					logger.Printf("After refresh: height=%d", scrollHeight)
 				}
 				prevCardCount = cardCount
 				prevScrollHeight = scrollHeight
-				chromedp.Sleep(time.Duration(10+rand.Float64()*10) * time.Second).Do(ctx)
+				chromedp.Sleep(10 * time.Second).Do(ctx)
 			}
 			if err := chromedp.Evaluate(`window.scrollTo(0, document.body.scrollHeight);`, nil).Do(ctx); err != nil {
-				log.Printf("First full-page scroll failed: %v", err)
+				logger.Printf("First full-page scroll failed: %v", err)
 			}
-			chromedp.Sleep(time.Duration(5+rand.Float64()*5) * time.Second).Do(ctx)
+			chromedp.Sleep(5 * time.Second).Do(ctx)
 			if err := chromedp.Evaluate(`window.scrollTo(0, document.body.scrollHeight);`, nil).Do(ctx); err != nil {
-				log.Printf("Second full-page scroll failed: %v", err)
+				logger.Printf("Second full-page scroll failed: %v", err)
 			}
-			chromedp.Sleep(time.Duration(5+rand.Float64()*5) * time.Second).Do(ctx)
+			chromedp.Sleep(5 * time.Second).Do(ctx)
 			if err := chromedp.Screenshot(`body`, &screenshot, chromedp.ByQuery).Do(ctx); err != nil {
-				log.Printf("Failed to take post-scroll screenshot: %v", err)
-			} else if err := WriteFile(fmt.Sprintf("screenshot_after_scroll_%d.png", attempt), screenshot, 0644); err != nil {
-				log.Printf("Failed to save post-scroll screenshot: %v", err)
+				logger.Printf("Failed to take post-scroll screenshot: %v", err)
+			} else if err := WriteFile(fmt.Sprintf("screenshot_after_scroll_%s_%d.png", query, attempt), screenshot, 0644, fileMu); err != nil {
+				logger.Printf("Failed to save post-scroll screenshot: %v", err)
 			}
 			return nil
 		}),
 
 		chromedp.ActionFunc(func(ctx context.Context) error {
-			log.Println("Simulating human behavior...")
+			logger.Println("Simulating human behavior...")
 			if err := chromedp.Evaluate(`
 				const moveMouse = (x, y) => {
 					const evt = new MouseEvent('mousemove', { clientX: x, clientY: y, bubbles: true });
@@ -300,18 +299,18 @@ func SearchAliExpress(query string, attempt int) ([]Product, error) {
 				if (Math.random() > 0.1) hoverRandom();
 				if (Math.random() > 0.5) clickRandom();
 			`, nil).Do(ctx); err != nil {
-				log.Printf("Human behavior simulation failed: %v", err)
+				logger.Printf("Human behavior simulation failed: %v", err)
 			}
-			chromedp.Sleep(time.Duration(2+rand.Float64()*3) * time.Second).Do(ctx)
+			chromedp.Sleep(2 * time.Second).Do(ctx)
 			if err := chromedp.Evaluate(`window.scrollTo(0, document.body.scrollHeight);`, nil).Do(ctx); err != nil {
-				log.Printf("Post-human-behavior scroll failed: %v", err)
+				logger.Printf("Post-human-behavior scroll failed: %v", err)
 			}
-			chromedp.Sleep(time.Duration(3+rand.Float64()*3) * time.Second).Do(ctx)
+			chromedp.Sleep(3 * time.Second).Do(ctx)
 			return nil
 		}),
 
 		chromedp.ActionFunc(func(ctx context.Context) error {
-			log.Println("Saving cookies...")
+			logger.Println("Saving cookies...")
 			var savedCookies []*network.Cookie
 			if err := chromedp.ActionFunc(func(ctx context.Context) error {
 				cookies, err := network.GetCookies().Do(ctx)
@@ -321,11 +320,11 @@ func SearchAliExpress(query string, attempt int) ([]Product, error) {
 				savedCookies = cookies
 				return nil
 			}).Do(ctx); err != nil {
-				log.Printf("Failed to retrieve cookies: %v", err)
-			} else if err := SaveCookies(cookiesFile, savedCookies); err != nil {
-				log.Printf("Failed to save cookies to %s: %v", cookiesFile, err)
+				logger.Printf("Failed to retrieve cookies: %v", err)
+			} else if err := SaveCookies(cookiesFile, savedCookies, fileMu); err != nil {
+				logger.Printf("Failed to save cookies to %s: %v", cookiesFile, err)
 			} else {
-				log.Printf("Cookies saved to %s", cookiesFile)
+				logger.Printf("Cookies saved to %s", cookiesFile)
 			}
 			return nil
 		}),
@@ -348,13 +347,13 @@ func SearchAliExpress(query string, attempt int) ([]Product, error) {
 				return fmt.Errorf("link selector check failed: %v", err)
 			}
 			if !nameExists || !priceExists || !ordersExists || !ratingExists || !linkExists {
-				log.Printf("Invalid selectors: name=%v, price=%v, orders=%v, rating=%v, link=%v", nameExists, priceExists, ordersExists, ratingExists, linkExists)
+				logger.Printf("Invalid selectors: name=%v, price=%v, orders=%v, rating=%v, link=%v", nameExists, priceExists, ordersExists, ratingExists, linkExists)
 			}
 			return nil
 		}),
 
 		chromedp.ActionFunc(func(ctx context.Context) error {
-			log.Println("Polling for products...")
+			logger.Println("Polling for products...")
 			var isReady bool
 			err := chromedp.Poll(
 				`(function() {
@@ -371,40 +370,40 @@ func SearchAliExpress(query string, attempt int) ([]Product, error) {
 				chromedp.WithPollingInterval(3*time.Second),
 			).Do(ctx)
 			if err != nil {
-				log.Printf("Polling failed: %v", err)
+				logger.Printf("Polling failed: %v", err)
 				if err := chromedp.Screenshot(`body`, &screenshot, chromedp.ByQuery).Do(ctx); err != nil {
-					log.Printf("Failed to take failure screenshot: %v", err)
-				} else if err := WriteFile(fmt.Sprintf("screenshot_polling_failure_%d.png", attempt), screenshot, 0644); err != nil {
-					log.Printf("Failed to save failure screenshot: %v", err)
+					logger.Printf("Failed to take failure screenshot: %v", err)
+				} else if err := WriteFile(fmt.Sprintf("screenshot_polling_failure_%s_%d.png", query, attempt), screenshot, 0644, fileMu); err != nil {
+					logger.Printf("Failed to save failure screenshot: %v", err)
 				}
-				if err := WriteFile(fmt.Sprintf("network_log_%d.txt", attempt), []byte(strings.Join(networkLogs, "\n")), 0644); err != nil {
-					log.Printf("Failed to save network log: %v", err)
+				if err := WriteFile(fmt.Sprintf("network_log_%s_%d.txt", query, attempt), []byte(strings.Join(networkLogs, "\n")), 0644, fileMu); err != nil {
+					logger.Printf("Failed to save network log: %v", err)
 				}
 				var pageHTML string
 				if err := chromedp.Evaluate(`document.documentElement.outerHTML`, &pageHTML).Do(ctx); err != nil {
-					log.Printf("Page HTML capture failed: %v", err)
-				} else if err := WriteFile(fmt.Sprintf("debug_page_polling_%d.html", attempt), []byte(pageHTML), 0644); err != nil {
-					log.Printf("Failed to save page HTML: %v", err)
+					logger.Printf("Page HTML capture failed: %v", err)
+				} else if err := WriteFile(fmt.Sprintf("debug_page_polling_%s_%d.html", query, attempt), []byte(pageHTML), 0644, fileMu); err != nil {
+					logger.Printf("Failed to save page HTML: %v", err)
 				}
 				var cardListHTML string
 				if err := chromedp.Evaluate(`document.querySelector('[id="card-list"]') ? document.querySelector('[id="card-list"]').outerHTML : 'No card-list found'`, &cardListHTML).Do(ctx); err != nil {
-					log.Printf("Card list HTML capture failed: %v", err)
-				} else if err := WriteFile(fmt.Sprintf("debug_card_list_%d.html", attempt), []byte(cardListHTML), 0644); err != nil {
-					log.Printf("Failed to save card list HTML: %v", err)
+					logger.Printf("Card list HTML capture failed: %v", err)
+				} else if err := WriteFile(fmt.Sprintf("debug_card_list_%s_%d.html", query, attempt), []byte(cardListHTML), 0644, fileMu); err != nil {
+					logger.Printf("Failed to save card list HTML: %v", err)
 				}
 				return fmt.Errorf("failed to detect products or CAPTCHA: %v", err)
 			}
 			if !isReady {
-				log.Println("Polling condition not met, refreshing page...")
+				logger.Println("Polling condition not met, refreshing page...")
 				if err := chromedp.Evaluate(`location.reload()`, nil).Do(ctx); err != nil {
 					return fmt.Errorf("failed to refresh page: %v", err)
 				}
-				chromedp.Sleep(time.Duration(20+rand.Float64()*10) * time.Second).Do(ctx)
+				chromedp.Sleep(20 * time.Second).Do(ctx)
 				var cardCount int
 				if err := chromedp.Evaluate(`document.querySelectorAll('[id="card-list"] a.search-card-item').length`, &cardCount).Do(ctx); err != nil {
 					return fmt.Errorf("failed to get card count after refresh: %v", err)
 				}
-				log.Printf("After refresh: %d cards", cardCount)
+				logger.Printf("After refresh: %d cards", cardCount)
 				if cardCount < 40 {
 					return fmt.Errorf("insufficient product cards after refresh: %d", cardCount)
 				}
@@ -423,22 +422,22 @@ func SearchAliExpress(query string, attempt int) ([]Product, error) {
 			if err := chromedp.Evaluate(`document.querySelectorAll('[id="card-list"] a.lj_g').length`, &ljgLinkCount).Do(ctx); err != nil {
 				return fmt.Errorf("failed to get lj_g link count: %v", err)
 			}
-			log.Printf("Found %d product cards, %d primary links, %d fallback links, %d lj_g links", cardCount, primaryLinkCount, fallbackLinkCount, ljgLinkCount)
+			logger.Printf("Found %d product cards, %d primary links, %d fallback links, %d lj_g links", cardCount, primaryLinkCount, fallbackLinkCount, ljgLinkCount)
 
 			var captchaVisible bool
 			if err := chromedp.Evaluate(`document.querySelector('.captcha-container, .sliderCaptcha, .baxia-dialog, .nc_wrapper, .captcha') !== null`, &captchaVisible).Do(ctx); err != nil {
 				return fmt.Errorf("CAPTCHA check failed: %v", err)
 			}
-			log.Printf("CAPTCHA visible: %v", captchaVisible)
+			logger.Printf("CAPTCHA visible: %v", captchaVisible)
 			if captchaVisible {
 				return fmt.Errorf("CAPTCHA detected")
 			}
 			if cardCount < 40 || (primaryLinkCount < 40 && fallbackLinkCount < 40 && ljgLinkCount < 40) {
-				log.Println("Insufficient cards or links, refreshing page...")
+				logger.Println("Insufficient cards or links, refreshing page...")
 				if err := chromedp.Evaluate(`location.reload()`, nil).Do(ctx); err != nil {
 					return fmt.Errorf("failed to refresh page: %v", err)
 				}
-				chromedp.Sleep(time.Duration(20+rand.Float64()*10) * time.Second).Do(ctx)
+				chromedp.Sleep(20 * time.Second).Do(ctx)
 				var newCardCount, newPrimaryLinkCount, newFallbackLinkCount, newLjgLinkCount int
 				if err := chromedp.Evaluate(`document.querySelectorAll('[id="card-list"] a.search-card-item').length`, &newCardCount).Do(ctx); err != nil {
 					return fmt.Errorf("failed to get card count after refresh: %v", err)
@@ -452,7 +451,7 @@ func SearchAliExpress(query string, attempt int) ([]Product, error) {
 				if err := chromedp.Evaluate(`document.querySelectorAll('[id="card-list"] a.lj_g').length`, &newLjgLinkCount).Do(ctx); err != nil {
 					return fmt.Errorf("failed to get lj_g link count after refresh: %v", err)
 				}
-				log.Printf("After refresh: %d cards, %d primary links, %d fallback links, %d lj_g links", newCardCount, newPrimaryLinkCount, newFallbackLinkCount, newLjgLinkCount)
+				logger.Printf("After refresh: %d cards, %d primary links, %d fallback links, %d lj_g links", newCardCount, newPrimaryLinkCount, newFallbackLinkCount, newLjgLinkCount)
 				if newCardCount < 40 || (newPrimaryLinkCount < 40 && newFallbackLinkCount < 40 && newLjgLinkCount < 40) {
 					return fmt.Errorf("insufficient product cards (%d) or links (primary=%d, fallback=%d, lj_g=%d) after refresh", newCardCount, newPrimaryLinkCount, newFallbackLinkCount, newLjgLinkCount)
 				}
@@ -466,7 +465,7 @@ func SearchAliExpress(query string, attempt int) ([]Product, error) {
 		}),
 
 		chromedp.ActionFunc(func(ctx context.Context) error {
-			log.Println("Extracting product details...")
+			logger.Println("Extracting product details...")
 			var rawProducts []map[string]interface{}
 			var debugHTML []string
 			if err := chromedp.Evaluate(`
@@ -500,7 +499,7 @@ func SearchAliExpress(query string, attempt int) ([]Product, error) {
 					return result;
 				}).filter(p => p.name && p.price && p.link);
 			`, &rawProducts).Do(ctx); err != nil {
-				log.Printf("Primary extraction failed: %v", err)
+				logger.Printf("Primary extraction failed: %v", err)
 				// Try fallback selector
 				if err := chromedp.Evaluate(`
 					Array.from(document.querySelectorAll('[id="card-list"] a[href*="/item/"]')).slice(0, 60).map(el => {
@@ -543,7 +542,7 @@ func SearchAliExpress(query string, attempt int) ([]Product, error) {
 				link, _ := p["link"].(string)
 				if link == "" {
 					missingLinks++
-					log.Printf("Missing link for product: %s", p["name"].(string))
+					logger.Printf("Missing link for product: %s", p["name"].(string))
 				}
 				product := Product{
 					Name:  p["name"].(string),
@@ -558,7 +557,7 @@ func SearchAliExpress(query string, attempt int) ([]Product, error) {
 						cleanOrders := strings.ReplaceAll(matches[1], ",", "")
 						orders, err := strconv.Atoi(cleanOrders)
 						if err != nil {
-							log.Printf("Failed to parse orders '%s': %v", ordersStr, err)
+							logger.Printf("Failed to parse orders '%s': %v", ordersStr, err)
 						} else {
 							product.Orders = orders
 							ordersCount++
@@ -570,13 +569,13 @@ func SearchAliExpress(query string, attempt int) ([]Product, error) {
 				if ratingStr != "" {
 					rating, err := strconv.ParseFloat(ratingStr, 64)
 					if err != nil {
-						log.Printf("Failed to parse rating '%s' for product '%s': %v", ratingStr, product.Name, err)
+						logger.Printf("Failed to parse rating '%s' for product '%s': %v", ratingStr, product.Name, err)
 					} else {
 						product.Rating = &rating
 					}
 				} else {
 					missingRatings++
-					log.Printf("Missing rating for product: %s", product.Name)
+					logger.Printf("Missing rating for product: %s", product.Name)
 					zero := 0.0
 					product.Rating = &zero
 				}
@@ -589,38 +588,38 @@ func SearchAliExpress(query string, attempt int) ([]Product, error) {
 
 				products = append(products, product)
 			}
-			log.Printf("Parsed orders for %d products", ordersCount)
+			logger.Printf("Parsed orders for %d products", ordersCount)
 			if missingRatings > 0 {
-				log.Printf("Missing ratings for %d products (set to 0.0)", missingRatings)
+				logger.Printf("Missing ratings for %d products (set to 0.0)", missingRatings)
 			}
 			if missingLinks > 0 {
-				log.Printf("Missing links for %d products", missingLinks)
+				logger.Printf("Missing links for %d products", missingLinks)
 			}
 			if missingRatings > 0 || missingLinks > 0 {
-				log.Printf("Check debug_extract_%d.html for missing ratings or links", attempt)
-				if err := WriteFile(fmt.Sprintf("debug_extract_%d.html", attempt), []byte(strings.Join(debugHTML, "\n---\n")), 0644); err != nil {
-					log.Printf("Failed to save debug HTML: %v", err)
+				logger.Printf("Check debug_extract_%s_%d.html for missing ratings or links", query, attempt)
+				if err := WriteFile(fmt.Sprintf("debug_extract_%s_%d.html", query, attempt), []byte(strings.Join(debugHTML, "\n---\n")), 0644, fileMu); err != nil {
+					logger.Printf("Failed to save debug HTML: %v", err)
 				}
 			}
-			log.Printf("Extracted %d products", len(products))
+			logger.Printf("Extracted %d products", len(products))
 
-			if err := WriteFile(fmt.Sprintf("network_log_%d.txt", attempt), []byte(strings.Join(networkLogs, "\n")), 0644); err != nil {
-				log.Printf("Failed to save network log: %v", err)
+			if err := WriteFile(fmt.Sprintf("network_log_%s_%d.txt", query, attempt), []byte(strings.Join(networkLogs, "\n")), 0644, fileMu); err != nil {
+				logger.Printf("Failed to save network log: %v", err)
 			}
 			var cardListHTML string
 			if err := chromedp.Evaluate(`document.querySelector('[id="card-list"]') ? document.querySelector('[id="card-list"]').outerHTML : 'No card-list found'`, &cardListHTML).Do(ctx); err != nil {
-				log.Printf("Card list HTML capture failed: %v", err)
-			} else if err := WriteFile(fmt.Sprintf("debug_card_list_%d.html", attempt), []byte(cardListHTML), 0644); err != nil {
-				log.Printf("Failed to save card list HTML: %v", err)
+				logger.Printf("Card list HTML capture failed: %v", err)
+			} else if err := WriteFile(fmt.Sprintf("debug_card_list_%s_%d.html", query, attempt), []byte(cardListHTML), 0644, fileMu); err != nil {
+				logger.Printf("Failed to save card list HTML: %v", err)
 			}
 			return nil
 		}),
 
 		chromedp.ActionFunc(func(ctx context.Context) error {
 			if err := chromedp.Screenshot(`body`, &screenshot, chromedp.ByQuery).Do(ctx); err != nil {
-				log.Printf("Failed to take final screenshot: %v", err)
-			} else if err := WriteFile(fmt.Sprintf("screenshot_attempt_%d.png", attempt), screenshot, 0644); err != nil {
-				log.Printf("Failed to save final screenshot: %v", err)
+				logger.Printf("Failed to take final screenshot: %v", err)
+			} else if err := WriteFile(fmt.Sprintf("screenshot_attempt_%s_%d.png", query, attempt), screenshot, 0644, fileMu); err != nil {
+				logger.Printf("Failed to save final screenshot: %v", err)
 			}
 			return nil
 		}),

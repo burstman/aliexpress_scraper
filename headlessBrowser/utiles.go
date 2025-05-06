@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"sync"
 
 	"github.com/chromedp/cdproto/network"
 )
@@ -27,16 +28,18 @@ func LoadCookies(filename string) ([]*network.Cookie, error) {
 }
 
 // SaveCookies saves cookies to a JSON file.
-func SaveCookies(filename string, cookies []*network.Cookie) error {
+func SaveCookies(filename string, cookies []*network.Cookie, mu *sync.Mutex) error {
 	data, err := json.Marshal(cookies)
 	if err != nil {
 		return err
 	}
 
-	return WriteFile(filename, data, 0644)
+	return WriteFile(filename, data, 0644, mu)
 }
 
-// WriteFile writes data to a file with the specified permissions.
-func WriteFile(filename string, data []byte, perm os.FileMode) error {
+// WriteFile writes data to a file with the specified permissions, thread-safely.
+func WriteFile(filename string, data []byte, perm os.FileMode, mu *sync.Mutex) error {
+	mu.Lock()
+	defer mu.Unlock()
 	return os.WriteFile(filename, data, perm)
 }
